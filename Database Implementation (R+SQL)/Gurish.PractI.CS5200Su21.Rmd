@@ -1,0 +1,463 @@
+---
+title: "CS5200 - Practicum I"
+author: "by Ernie Gurish"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+# Practicum I - Bird Strike Data
+
+### (1) Create our ERD
+
+First we create our logical model with an Entity-Relationship Diagram (ERD) using Crow's Foot notation. For the sake of simplicity, I have left lookup tables for categorical values out of both the ERD and the implementation, though a true implementation should likely have them. 
+
+The ERD/model is pictured below and the link to it is: https://lucid.app/documents/view/f4bde2bb-9f7f-4e56-96f8-84c47222620b
+
+#![Practicum I Crow's Foot ERD](c:/Users/emgur/Desktop/NEU/CS5200/Practicum I/ERD.jpeg)
+
+### Connect to our database
+
+Before we can create our tables with DDL statements, we must connect to our existing (but empty) database file. Here I used MySQL installed locally on my computer. 
+
+```{r}
+# Make sure our MySQL connection library is installed
+if("RMariaDB" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("RMariaDB")
+}
+library(RMariaDB)
+
+dbfile <- "EGpracticumI"
+usr <- "rstudio"
+pwd <- "cs5200p1"
+
+# Connect to the local database
+dbcon <- dbConnect(RMariaDB::MariaDB(), username=usr, password=pwd, dbname=dbfile)
+
+# Check that our connection was successful and no tables currently exist
+dbListTables(dbcon)
+```
+
+### (2) Create our tables via DDL statements
+
+Now we use our CREATE TABLE statements to realize the ERD show above. We will set our primary keys, foreign keys, and any basic constraints or default values. We can drop each table first if we need to reset any data, as shown in the R chunk below.
+
+```{r, results='hide'}
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS bird_strike_event;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS flight;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS aircraft;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS wildlife;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS flight_phase;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS airline;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS airport;")
+dbSendStatement(dbcon, "DROP TABLE IF EXISTS state;")
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS aircraft (
+    make_model VARCHAR(120),
+    craft_type VARCHAR(50) NOT NULL DEFAULT "Airplane",
+    num_engines INTEGER NOT NULL,
+    is_large VARCHAR(5),
+    PRIMARY KEY (make_model)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS wildlife (
+    species VARCHAR(120),
+    PRIMARY KEY (species)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS flight_phase (
+    phase VARCHAR(120),
+    PRIMARY KEY (phase)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS airline (
+    operator VARCHAR(120),
+    PRIMARY KEY (operator)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS airport (
+    name VARCHAR(120),
+    PRIMARY KEY (name)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS state (
+    name VARCHAR(50),
+    PRIMARY KEY (name)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS flight (
+    flight_id INTEGER AUTO_INCREMENT,
+    aircraft_model VARCHAR(120) NOT NULL,
+    airline_operator VARCHAR(120) NOT NULL,
+    origin_airport VARCHAR(120) NOT NULL,
+    flight_date DATE NOT NULL,
+    origin_state VARCHAR(50) NOT NULL,
+    PRIMARY KEY (flight_id),
+    FOREIGN KEY (aircraft_model) REFERENCES aircraft(make_model),
+    FOREIGN KEY (airline_operator) REFERENCES airline(operator),
+    FOREIGN KEY (origin_airport) REFERENCES airport(name),
+    FOREIGN KEY (origin_state) REFERENCES state(name)
+);
+```
+
+```{sql connection=dbcon}
+CREATE TABLE IF NOT EXISTS bird_strike_event (
+    record_id INTEGER,
+    flight_id INTEGER,
+    wildlife_hit VARCHAR(120),
+    flight_impact VARCHAR(120) NOT NULL DEFAULT "None",
+    damage VARCHAR(20) DEFAULT "No damage",
+    phase VARCHAR(120),
+    remarks VARCHAR(1000) DEFAULT "None",
+    altitude INTEGER NOT NULL,
+    num_injured INTEGER NOT NULL,
+    PRIMARY KEY (record_id),
+    FOREIGN KEY (flight_id) REFERENCES flight(flight_id),
+    FOREIGN KEY (wildlife_hit) REFERENCES wildlife(species),
+    FOREIGN KEY (phase) REFERENCES flight_phase(phase)
+);
+```
+
+### (3) Load bird strike data from CSV
+
+Start by loading in our CSV...
+```{r, results='hide'}
+fpath <- "c:/Users/emgur/Desktop/NEU/CS5200/Practicum I"
+fname <- "BirdStrikesData.csv"
+fileName <- paste(fpath, fname, sep = "/")
+birdDF <- read.csv(fileName, header = TRUE, stringsAsFactors = FALSE)
+```
+...and taking an initial look at the data.
+```{r}
+head(birdDF, 5)
+```
+
+We can then:  
+1. Remove unnecessary characters from our column names to make them easier to access
+```{r}
+# Replace unwanted characters with empty character
+for (i in 1:ncol(birdDF)) {
+  colnames(birdDF)[i] <- gsub("[.ï]", "", colnames(birdDF)[i])
+}
+```
+
+2. Remove columns not needed for our database requirements
+```{r}
+# Remove columns containing data not needed for our app
+birdDF <- subset(birdDF, select = -c(WildlifeNumberStruckActual, Altitudebin,
+                                     WildlifeNumberstruck, WildlifeNumberStruckActual,
+                                     ConditionsPrecipitation, Remainsofwildlifecollected,
+                                     RemainsofwildlifesenttoSmithsonian, WildlifeSize,
+                                     ConditionsSky,Pilotwarnedofbirdsorwildlife, 
+                                     CostTotal))
+```
+
+3. Remove data we don't know or fill in data based on our assumptions
+
+I have kept some columns not strictly needed for the practicum (e.g. damage, pilot remarks, etc.) under the assumption that an app for pilots to report bird strikes to might want to collect this data.
+```{r}
+# Remove rows lacking flight or aircraft data. All the records this one line removes
+# are the rows with missing airport info, size info, as well as aircraft type
+birdDF <- birdDF[-which(birdDF$AircraftType == ""), ]
+
+# Convert it to correct date formatting
+birdDF$FlightDate <- as.Date(birdDF$FlightDate, "%m/%d/%Y")
+# Store it back into character as otherwise MySQL interprets it as a double
+birdDF$FlightDate <- as.character(birdDF$FlightDate)
+
+# Fix blank number of engines to be 2 as it is the most common
+birdDF$AircraftNumberofengines[which(birdDF$AircraftNumberofengines == "")] <- "2"
+birdDF$AircraftNumberofengines[which(birdDF$AircraftNumberofengines == "C")] <- "2"
+
+# A few aircraft models have multiple engine numbers listed (important as Model is our PK)
+# Fix this under the assumption it should be most frequently appearing number of engines
+# for that particular model number
+birdDF$AircraftNumberofengines[which(birdDF$AircraftMakeModel == "A-300" &
+                                       birdDF$AircraftNumberofengines == "4")] <- "2"
+birdDF$AircraftNumberofengines[which(birdDF$AircraftMakeModel == "B-747-8 SERIES" &
+                                       birdDF$AircraftNumberofengines == "4")] <- "2"
+
+# This should also be an integer, not character field
+birdDF$AircraftNumberofengines <- as.integer(birdDF$AircraftNumberofengines)
+
+# Feet above ground should be integer as well, but must remove commas first
+birdDF$Feetaboveground <- gsub("[,]", "", birdDF$Feetaboveground)
+birdDF$Feetaboveground <- as.integer(birdDF$Feetaboveground)
+
+# Set remarks to "None" if empty
+birdDF$Remarks[which(birdDF$Remarks == "")] <- "None"
+
+# Remove unwanted * character from some US AIRWAYS entries
+birdDF$AircraftAirlineOperator[which(birdDF$AircraftAirlineOperator == 
+                                                          "US AIRWAYS*")] <- "US AIRWAYS"
+
+# Set all "Unknown bird" entries to say only that (a lot of them include size information)
+birdDF$WildlifeSpecies[which(grepl("Unknown bird", 
+                                   birdDF$WildlifeSpecies))] <- "Unknown bird"
+
+# Also, we use a flight_no field to track our flights so we can add that 
+# (arbitrary) PK here to make the import process easier
+birdDF$flight_id <- 1:nrow(birdDF)
+```
+
+Now that our data is clean, we can begin loading the information into our tables. We will check to make sure we successfully loaded the data after each table by querying a small sample.
+
+Note that we will use sqldf to format our tables to be written out to the database.
+```{r, results='hide'}
+if("sqldf" %in% rownames(installed.packages()) == FALSE) {
+  install.packages("sqldf")
+}
+library(sqldf)
+```
+
+Start with some of our smaller tables:
+```{r}
+df.wildlife <- sqldf("SELECT DISTINCT WildlifeSpecies as species
+                     FROM birdDF
+                     ORDER BY species;")
+dbWriteTable(dbcon, "wildlife", df.wildlife, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM wildlife LIMIT 10;")
+```
+
+```{r}
+df.phase <- sqldf("SELECT DISTINCT WhenPhaseofflight as phase
+                     FROM birdDF
+                     ORDER BY phase;")
+dbWriteTable(dbcon, "flight_phase", df.phase, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM flight_phase LIMIT 10;")
+```
+
+```{r}
+df.airline <- sqldf("SELECT DISTINCT AircraftAirlineOperator as operator
+                     FROM birdDF
+                     ORDER BY operator;")
+dbWriteTable(dbcon, "airline", df.airline, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM airline LIMIT 10;")
+```
+
+```{r}
+df.airport <- sqldf("SELECT DISTINCT AirportName as name
+                     FROM birdDF
+                     ORDER BY name;")
+dbWriteTable(dbcon, "airport", df.airport, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM airport LIMIT 10;")
+```
+
+```{r}
+df.state <- sqldf("SELECT DISTINCT OriginState as name
+                     FROM birdDF
+                     ORDER BY name;")
+dbWriteTable(dbcon, "state", df.state, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM state LIMIT 10;")
+```
+
+```{r}
+df.aircraft <- sqldf("SELECT DISTINCT AircraftMakeModel as make_model, 
+                     AircraftType as craft_type, 
+                     AircraftNumberofengines as num_engines, 
+                     IsAircraftLarge as is_large 
+                     FROM birdDF 
+                     ORDER BY AircraftMakeModel;")
+dbWriteTable(dbcon, "aircraft", df.aircraft, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM aircraft LIMIT 10;")
+```
+
+Now we load our larger tables that require foreign key checking. We could have loaded these tables first by using dbSendStatement() to set foreign key checks off before we uploaded our data. However, doing it this way has the added benefit of making sure our foreign key tables are set up properly.
+```{r}
+df.flight <- sqldf("SELECT flight_id,
+                     AircraftMakeModel as aircraft_model,
+                     AircraftAirlineOperator as airline_operator, 
+                     AirportName as origin_airport, 
+                     FlightDate as flight_date,
+                     OriginState as origin_state
+                    FROM birdDF 
+                    ORDER BY flight_id;")
+dbWriteTable(dbcon, "flight", df.flight, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM flight LIMIT 10;")
+```
+
+```{r}
+df.birdstrike <- sqldf("SELECT RecordID as record_id, 
+                         flight_id,
+                         WildlifeSpecies as wildlife_hit, 
+                         EffectImpacttoflight as flight_impact, 
+                         EffectIndicatedDamage as damage, 
+                         Whenphaseofflight as phase, 
+                         Remarks as remarks, 
+                         Feetaboveground as altitude, 
+                         Numberofpeopleinjured as num_injured
+                      FROM birdDF
+                      ORDER BY record_id;")
+dbWriteTable(dbcon, "bird_strike_event", df.birdstrike, append = TRUE)
+
+dbGetQuery(dbcon, "SELECT * FROM bird_strike_event LIMIT 10;")
+```
+
+### (4) SQL Query: Number of bird strikes for each airline upon take-off or climb
+```{sql connection=dbcon}
+SELECT COUNT(record_id) AS NumBirdStrikes, F.airline_operator AS Airline
+FROM bird_strike_event as B
+  INNER JOIN flight AS F
+  ON B.flight_id = F.flight_id
+WHERE B.phase LIKE "Take-off%" OR B.phase LIKE "Climb"
+GROUP BY Airline
+ORDER BY NumBirdStrikes DESC;
+```
+
+### (5) SQL Query: Airport(s) that had the most bird strike incidents
+```{sql connection=dbcon}
+SELECT MAX(NumBirdStrikes) as MostBirdStrikes, Airport
+FROM (SELECT COUNT(record_id) AS NumBirdStrikes, F.origin_airport AS Airport
+      FROM bird_strike_event AS B
+        INNER JOIN flight AS F
+        ON B.flight_id = F.flight_id
+      GROUP BY Airport
+      ORDER BY NumBirdStrikes DESC) AS NumStrikes;
+```
+
+### (6) SQL Query: Number of bird strike incidents by year
+```{sql connection=dbcon}
+SELECT COUNT(B.record_id) AS NumBirdStrikes, EXTRACT(YEAR FROM F.flight_date) AS Year
+FROM bird_strike_event as B
+  INNER JOIN flight as F
+  ON B.flight_id = F.flight_id
+GROUP BY Year
+ORDER BY Year;
+```
+
+### (7) Visualizing the number of bird strike incidents per year (2008-2011) during take-off/climb and during decent/approach/landing
+
+First we collect our take-off/climb data into a dataframe:
+```{r}
+df.climbdata <- dbGetQuery(dbcon, "SELECT COUNT(B.record_id) AS NumBirdStrikes, 
+                                    EXTRACT(YEAR FROM F.flight_date) AS Year,
+                                    \"Take-off/Climb\"
+                                  FROM bird_strike_event as B
+                                    INNER JOIN flight as F
+                                    ON B.flight_id = F.flight_id
+                                  WHERE (B.phase LIKE \"Take-off%\" OR 
+                                    B.phase LIKE \"Climb\")
+                                  GROUP BY Year
+                                  HAVING Year BETWEEN 2008 AND 2011 
+                                  ORDER BY Year;")
+# Make sure the query worked
+head(df.climbdata)
+```
+
+Second get our descent/approach/landing data into a dataframe:
+```{r}
+df.landdata <- dbGetQuery(dbcon, "SELECT COUNT(B.record_id) AS NumBirdStrikes, 
+                                    EXTRACT(YEAR FROM F.flight_date) AS Year,
+                                    \"Descent/Approach/Landing\"
+                                  FROM bird_strike_event as B
+                                    INNER JOIN flight as F
+                                    ON B.flight_id = F.flight_id
+                                  WHERE (B.phase LIKE \"Descent\" OR 
+                                    B.phase LIKE \"Approach\" OR
+                                    B.phase LIKE \"Landing%\")
+                                  GROUP BY Year
+                                  HAVING Year BETWEEN 2008 AND 2011 
+                                  ORDER BY Year;")
+# Make sure the query worked
+head(df.landdata)
+```
+Next we can the join the two tables by year to consolidate our tables:
+```{r}
+df.yearstrikes <- sqldf("SELECT C.NumBirdStrikes AS \"Take-off/Climb\", 
+                          L.NumBirdStrikes AS \"Descent/Approach/Landing\", 
+                          C.Year
+                         FROM `df.climbdata` as C
+                          INNER JOIN `df.landdata` as L
+                          ON C.Year = L.Year
+                         ORDER BY C.Year;", method = "raw")
+
+# Make sure our join worked
+head(df.yearstrikes, 4)
+```
+
+Now we have our data together in one dataframe and we can finally reformat it into a matrix to easily create our barchart.
+```{r}
+# Initialize our matrix
+data.plot <- matrix(nrow = 2, ncol = 4)
+# The take-off/climb & descent/landing columns become our rows
+rownames(data.plot) <- c(colnames(df.yearstrikes)[1], colnames(df.yearstrikes)[2])
+# Year becomes our column labels (& is to be the x-axis of our chart)
+colnames(data.plot) <- df.yearstrikes$Year
+# Fill in our number of strikes (number is our y-axis) for both rows
+data.plot[1, ] <- df.yearstrikes$`Take-off/Climb`
+data.plot[2, ] <- df.yearstrikes$`Descent/Approach/Landing`
+# Finally plot it out
+barplot(data.plot, 
+        main = "Bird Strike Incidents (2008-2011) by Phase",
+        xlab = "Year",
+        ylab = "Number of bird strikes",
+        legend = rownames(data.plot),
+        col = c("green", "blue"),
+        ylim = c(0, 2500),
+        args.legend = list(x = "topright", bty = "n", inset=c(-0.05,-0.05)),
+        beside = TRUE)
+```
+I found the tutorial at this link (https://www.dataanalytics.org.uk/legends-on-graphs-and-charts/) to be very helpful for figuring out the correct formatting of the graph above.
+
+### (8) Creating a stored procedure to remove a bird strike incident
+
+First we create our stored procedure. Since our bird_strike_event table has a primary key composed of solely a record_id, that is all the information we need to remove a bird strike incident. Additionally, our record_id is not referenced in any other table so we do not have to concern ourselves with updating any additional tables. I utilized this link (https://www.w3resource.com/mysql/mysql-procedure.php) to help ensure my stored procedure code was correct.
+```{sql connection=dbcon}
+CREATE PROCEDURE RemoveBirdStrike(strike_id INTEGER)
+BEGIN
+  DELETE FROM bird_strike_event 
+  WHERE record_id = strike_id;
+END;
+```
+
+Now that our procedure has been created, we can test it on our bird strike incident table. We can choose an arbitrary record_id to delete as a test. We will try to remove record_id 1195 from the result set below by CALLing our stored procedure:
+```{sql connection=dbcon}
+SELECT * 
+FROM bird_strike_event
+LIMIT 5;
+```
+
+```{sql connection=dbcon}
+CALL RemoveBirdStrike(1195);
+```
+
+We can double check that it is gone with:
+```{sql connection=dbcon}
+SELECT * 
+FROM bird_strike_event
+LIMIT 5;
+```
+
+And, to be even more sure that the deletion was successful, we can run a query looking for record_id 1195 specifically:
+```{sql connection=dbcon}
+SELECT * 
+FROM bird_strike_event
+WHERE record_id = 1195;
+```
+
+### Lastly, disconnect from our database
+
+```{r, results='hide'}
+dbDisconnect(dbcon)
+```

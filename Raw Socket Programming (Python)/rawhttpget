@@ -1,0 +1,815 @@
+#!/usr/bin/python3
+
+'''
+Jessie Hackford
+Ernie Gurish
+CS5700 - Spring 2021
+Project 4 - Raw Sockets
+'''
+import socket, sys, time, random
+from struct import *
+from urllib.parse import urlparse
+
+EMPTY = ""
+UNROUTABLE = '10.0.0.0'
+HTTP_VERSION = 'HTTP/1.1'
+MAX_TIME = 180
+ACK_TIME = 60
+ERR_TIME = -1
+ERR_CHECKSUM = -2
+ERR_HTTP = -3
+MAX_SEQ = 4294967296
+MAX_BUFFER_LEN = 10
+MAX_CWND = 1000
+MAX_DUPS = 3
+HTTP_HEADER_MIN = 16
+DEF_NAME = 'index.html'
+SERVER_SEQ = 0  # this will be updated to the first server sequence number we receive
+
+g_outgoing_packets = {}
+g_received_packets = {}
+g_received_seqs = []
+g_sent_packets_in_transit = []
+
+'''
+    The backbone of this code is inspired by the Silver Moon tutorial on Raw Socket Programming in Python
+    https://www.binarytides.com/raw-socket-programming-in-python-linux/
+
+    Specifically, implementing the header layouts, the process of packing header structures and generating
+    pseudo-headers, and the checksum function are largely based off the code from that tutorial
+'''
+# class for packing and unpacking sent and received IP headers
+class IPHeader():
+    def __init__(self, src_address, dest_address, version = 4, inet_hdr_len = 5, service_type = 0, total_len = 0, id_num = 54321, fragment_offset = 0, time_to_live = 255,
+    protocol= socket.IPPROTO_TCP, checksum = 0):
+        self.inet_hdr_len = inet_hdr_len
+        self.version = version
+        self.service_type = service_type
+        self.total_len = total_len
+        self.id_num = id_num
+        self.fragment_offset = fragment_offset
+        self.time_to_live = time_to_live
+        self.protocol = protocol
+        self.checksum = checksum
+        self.src_address = socket.inet_aton(src_address)
+        self.dest_address = socket.inet_aton(dest_address)
+        self.inet_hdr_len_ver = (version << 4) + inet_hdr_len
+
+    def packIPHeader(self):
+        ip_header = pack('!BBHHHBBH4s4s', self.inet_hdr_len_ver, self.service_type, self.total_len, self.id_num, self.fragment_offset, self.time_to_live, self.protocol, self.checksum,
+        self.src_address, self.dest_address)
+        return ip_header
+
+    def UnpackIPHeader(packed):
+        unpacked = unpack_from('!BBHHHBBH4s4s', packed, 0)
+        source = socket.inet_ntoa(unpacked[8])
+        dest = socket.inet_ntoa(unpacked[9])
+        ret = [source, dest]
+        return ret
+
+    def fullUnpack(packed):
+        unpacked = unpack_from('!BBHHHBBH4s4s', packed, 0)
+        ver = unpacked[0] >> 4
+        hdr_len = unpacked[0] & 0x000f
+        tos = unpacked[1]
+        total_len = unpacked[2]
+        id = unpacked[3]
+        frag_off = unpacked[4]
+        ttl = unpacked[5]
+        prot = unpacked[6]
+        csum = unpacked[7]
+        source = socket.inet_ntoa(unpacked[8])
+        dest = socket.inet_ntoa(unpacked[9])
+        ret = [ver, hdr_len, tos, total_len, id, frag_off, ttl, prot, csum, source, dest]
+        return ret
+
+    def setChecksum(self, csum):
+        self.checksum = csum
+
+# class for our TCP header. Used to pack headers appropriately and unpack received headers.
+class TCPHeader():
+    def __init__(self, source_port, dest_port = 80, seq_num = 0, ack_num = 0, data_offset = 5, fin_flag = 0, syn_flag = 1, rst_flag = 0, psh_flag = 0, ack_flag = 0,
+    urg_flag = 0, window_size = 65535, tcp_checksum = 0, urgent_ptr = 0, optional_data=b''):
+        self.source_port = source_port
+        self.dest_port = dest_port
+        self.seq_num = seq_num
+        self.ack_num = ack_num
+        self.data_offset = data_offset
+        self.fin_flag = fin_flag
+        self.syn_flag = syn_flag
+        self.rst_flag = rst_flag
+        self.psh_flag = psh_flag
+        self.ack_flag = ack_flag
+        self.urg_flag = urg_flag
+        self.window_size = window_size
+        self.tcp_checksum = tcp_checksum
+        self.urgent_ptr = urgent_ptr
+        self.tcp_offset_res = (data_offset << 4)
+        self.optional_data = optional_data
+        self.packFlags()
+
+    def __str__(self):
+        string = "TCP Header: " + \
+        "source=" + str(self.source_port) + ", dest=" + str(self.dest_port) + \
+        ", seq=" + str(self.seq_num) + ", ack_seq=" + str(self.ack_num) + ", doff=" + str(self.data_offset) + ", fin=" + str(self.fin_flag) + \
+        ", syn=" + str(self.syn_flag) + ", rst=" + str(self.rst_flag) + ", psh=" + str(self.psh_flag) + ", ack=" + str(self.ack_flag) + \
+        ", urg=" + str(self.tcp_urg) + ", window=" + str(self.window_size) + ", check=" + str(self.tcp_checksum) + ", urg_ptr=" + str(self.urgent_ptr) + \
+        ", offset_res=" + str(self.tcp_offset_res) + ", flags=" + str(self.tcp_flags) + ", data"
+        return string
+
+    def packTCPHeader(self):
+        tcp_header = pack('!HHLLBBHHH', self.source_port, self.dest_port, self.seq_num, self.ack_num, self.tcp_offset_res, self.tcp_flags, self.window_size,
+        self.tcp_checksum, self.urgent_ptr)
+        tcp_header = tcp_header + self.optional_data
+        return tcp_header
+
+    def packChecksum(self, tcp_checksum):
+        tcp_header = pack('!HHLLBBHHH', self.source_port, self.dest_port, self.seq_num, self.ack_num, self.tcp_offset_res, self.tcp_flags, self.window_size, tcp_checksum, self.urgent_ptr)
+        tcp_header = tcp_header + self.optional_data
+        return tcp_header
+
+    def packFlags(self):
+        self.tcp_flags = self.fin_flag + (self.syn_flag << 1) + (self.rst_flag << 2) + (self.psh_flag << 3) + (self.ack_flag << 4) + (self.urg_flag << 5)
+
+    def UnpackTCPHeader(packed):
+        ret = []
+        unpacked = unpack_from('!HHLLBBHHH', packed, 0) #tuple with 9 items
+        optional_data_size = TCPHeader.getHdrLen(packed) - 20
+        non_opt_header_size = len(packed) - optional_data_size
+        # we don't need to unpack the optional data since we will only ever use it as bytes to verify checksums
+        optional_data = packed[non_opt_header_size:len(packed)]
+        for i in range(len(unpacked)):
+            ret.append(unpacked[i])
+        ret.append(optional_data)
+        return ret
+
+    # unpacked flags are in decimal form, need to be converted to binary
+    def ParseFlags(flags):
+        bin_flags = format(flags, '#010b')[2:]
+        #flag order: fin_flag + (syn_flag << 1) + (rst_flag << 2) + (psh_flag << 3) + (ack_flag << 4) + (urg_flag << 5)
+        return (bin_flags[-1], bin_flags[-2], bin_flags[-3], bin_flags[-4], bin_flags[-5], bin_flags[-6])
+
+    def IsFin(flags):
+        return int(flags[0]) == 1
+
+    def IsAck(flags):
+        return int(flags[4]) == 1
+
+    def setFlags(self, flags):
+        self.fin_flag = int(flags[0])
+        self.syn_flag = int(flags[1])
+        self.rst_flag = int(flags[2])
+        self.psh_flag = int(flags[3])
+        self.ack_flag = int(flags[4])
+        self.urg_flag = int(flags[5])
+        self.packFlags()
+
+    def GetSeqNum(packed):
+        unpacked = unpack_from('!HHLLBBHHH', packed, 0)
+        return unpacked[2]
+
+    def GetAckNum(packed):
+        unpacked = unpack_from('!HHLLBBHHH', packed, 0)
+        return unpacked[3]
+
+    def getWindow(packed):
+        unpacked = unpack_from('!HHLLBBHHH', packed, 0)
+        return unpacked[6]
+
+    def getHdrLen(packed):
+        unpacked = unpack_from('!HHLLBBHHH', packed, 0)
+        length = (unpacked[4] >> 4) * 4 # get the header length in bits
+        return length
+
+def create_pseudo_header(source_ip, dest_ip, packed_tcp_header, msg):
+    # convert both IP string into bytes
+    source_address = socket.inet_aton(source_ip)
+    dest_address = socket.inet_aton(dest_ip)
+    placeholder = 0
+    protocol = socket.IPPROTO_TCP # IPPROTO_TCP = 6 (int)
+    tcp_length = len(packed_tcp_header) + len(msg)
+
+    psh = pack('!4s4sBBH', source_address, dest_address, placeholder, protocol, tcp_length)
+    # if the msg is already in bytes (e.g when we're verifying checksum), don't encode
+    if isinstance(msg, bytes):
+        psh = psh + packed_tcp_header + msg
+    else:
+        psh = psh + packed_tcp_header + str.encode(msg)
+    return psh
+
+# function to generate checksum based off SilverMoon's raw socket tutorial in Python
+def checksum(msg):
+    csum = 0
+    for i in range(0, len(msg), 2):
+        word = int(msg[i]) + ((0 if (i+1 >= len(msg)) else int(msg[i+1])) << 8)
+        csum += word
+
+    csum = (csum >> 16) + (csum & 0xffff)
+    csum += (csum >> 16)
+    csum = ~csum & 0xffff
+    # the checksum algorithm assumes msg is little endian when it is actually big endian, so need to flip bytes in result to compensate
+    return socket.htons(csum)
+
+# Create new TCP packet data to duplicate received packet and verify checksum info
+def verify_checksum(packet_elements, packet, msg):
+    # check the IP header checksum+protocol, immediately return false if incorrect
+    ip_correct = verify_ip(packet, socket.IPPROTO_TCP)
+    if ip_correct == False:
+        return False
+
+    received_checksum = packet_elements[9]
+    new_flags = packet_elements[7]
+    # Generate new TCP header that duplicates received TCP header
+    # header fields: source_ip (0), dest_ip(1), source_port(2), dest_port(3), seq_num(4), ack_num(5), tcp_offset_data(6)
+    # tcp_flags(7), window_size(8), tcp_checksum(9), urgent_ptr(10)
+    new_header = TCPHeader(packet_elements[2], dest_port=packet_elements[3], seq_num=packet_elements[4], ack_num=packet_elements[5], data_offset=packet_elements[6],
+    window_size=packet_elements[8], urgent_ptr=packet_elements[10], optional_data=packet_elements[11])
+
+    new_header.setFlags(new_flags)
+    new_packed_header = new_header.packTCPHeader()
+
+    # Get info to create new pseudo-header for checksum calc
+    new_psh = create_pseudo_header(packet_elements[0], packet_elements[1], new_packed_header, msg)
+
+    # Generate new checksum based off duplicate packet
+    new_checksum = checksum(new_psh)
+
+    return new_checksum == received_checksum
+
+# create duplicate IP header, calculate checksum, and compare with the received IP checksum
+# also checks that the IP protocol matches the given protocol (TCP in this project)
+def verify_ip(packet, encap_proto):
+    # items = ver, hdr_len, tos, total_len, id, frag_off, ttl, prot, csum, source, dest
+    items = IPHeader.fullUnpack(packet)
+    received_checksum = items[8]
+
+    new_header = IPHeader(items[9], items[10], version=items[0], inet_hdr_len=items[1], service_type=items[2], total_len=items[3], id_num=items[4],
+    fragment_offset=items[5], time_to_live=items[6], protocol=items[7])
+    new_packed_header = new_header.packIPHeader()
+    new_checksum = checksum(new_packed_header)
+
+    # make sure the protocols match and checksums match
+    return new_checksum == received_checksum and encap_proto == items[7]
+
+def create_packet(source_ip, dest_ip, msg, source_port, seq_num=0, ack_num=0, fin_flag = 0, syn_flag = 1, ack_flag=0):
+    # create ip header
+    ip_header = IPHeader(source_ip, dest_ip)
+    csum = checksum(ip_header.packIPHeader()) # calc IP header checksum & set it
+    ip_header.setChecksum(csum)
+    ip_header = ip_header.packIPHeader()
+
+    # tcp header
+    if seq_num >= MAX_SEQ: # if we've gone past max, rollover our sequence number
+        seq_num = seq_num % MAX_SEQ
+    tcp_header = TCPHeader(source_port, seq_num=seq_num, ack_num=ack_num, fin_flag=fin_flag, syn_flag=syn_flag, ack_flag=ack_flag)
+    packed_tcp_header = tcp_header.packTCPHeader()
+    # generate pseudo header
+    psh = create_pseudo_header(source_ip, dest_ip, packed_tcp_header, msg)
+    # calculate checksum
+    tcp_check = checksum(psh)
+    # create packet by combining pseudo header with tcp header and data
+    tcp_header = tcp_header.packChecksum(tcp_check)
+    packet = ip_header + tcp_header + str.encode(msg)
+    return packet
+
+# simple binary search for looking through our global received packet list
+def binary_search(target, sequence_lst, start, end):
+    middle = 0
+    while end >= start:
+        middle = (start+end) // 2
+        if sequence_lst[middle] == target:
+            return middle
+        elif sequence_lst[middle] < target:
+            start = middle + 1
+        else:
+            end = middle - 1
+    return -1
+
+# produces the relative sequence number for proper TCP byte ordering
+def relative_seq_num(num):
+    return (num - SERVER_SEQ) % MAX_SEQ
+
+# inserts the sequence number at the right location in our received sequence list
+def order_seq_lst(seq, ack, length):
+    global g_received_seqs
+    # first calculate relative sequence number
+    relative_num = relative_seq_num(seq)
+    # then insert appropriately
+    for i in range(len(g_received_seqs)-1,-1, -1):
+        if (relative_num, ack, length) > g_received_seqs[i]:
+            g_received_seqs.insert(i+1, (relative_num, ack, length))
+            return
+    g_received_seqs.append((relative_num, ack, length))
+
+# check our received packets for a duplicate
+def is_dup(seq_num, ack_num, length):
+    global g_received_seqs
+    seq_num = relative_seq_num(seq_num) # we track relative sequence number
+    return binary_search((seq_num, ack_num, length), g_received_seqs, 0, len(g_received_seqs)-1) >= 0
+
+# generates a random starting sequence number for client packets
+def generate_starting_seq_num():
+    return random.randrange(0, MAX_SEQ)
+
+# a dictionary that holds all packets we intend to send to the server
+def queue_outgoing_packet(num, packet, dest_ip, msg_len, pkt_type = ""):
+    g_outgoing_packets[num] = (pkt_type, dest_ip, msg_len, packet)
+
+# store a list of packets by seq number so they can be sorted
+def store_out_of_order_packet(num, data_len, packet):
+    seq_num = relative_seq_num(num) # key by relative sequence number for sorting
+    g_received_packets[seq_num] = (data_len, packet) # keeps a copy of the packet itself for re-transmission
+
+# removes a packet from the outgoing queue and sends it to the server
+def send_packet_from_queue(send_sock):
+    packet_seq_num = list(g_outgoing_packets.keys())[0]
+
+    pkt_type = g_outgoing_packets[packet_seq_num][0]
+    dest = g_outgoing_packets[packet_seq_num][1]
+    packet = g_outgoing_packets[packet_seq_num][3]
+    msg_len = g_outgoing_packets[packet_seq_num][2]
+    send_sock.sendto(packet, (dest, 0))
+
+    # remove from the queue
+    g_outgoing_packets.pop(packet_seq_num)
+
+    # for special packet types (get/fin/syn), we require an ACK from the server
+    # so we track these packets in the g_sent_packets_in_transit list
+    if pkt_type == "get":
+        # calculate the expected ack value from the next incoming server packet
+        # it should be the packet sequence num + length of the message
+        expected_ack_from_server = packet_seq_num + msg_len
+        g_sent_packets_in_transit.append(expected_ack_from_server)
+
+    # for fin and syn packets, the msg_len is 0, but we want to increment the expected ack num by 1
+    if pkt_type == "fin" or pkt_type == "syn":
+        expected_ack_from_server = packet_seq_num + 1
+        g_sent_packets_in_transit.append(expected_ack_from_server)
+
+    return (packet_seq_num, msg_len)
+
+# matches a received ack number to a list of ACKS we expect to receive
+def match_ack(ack_num):
+    # if it is in the list of packets we expect to get, we remove that packet from the list
+    if ack_num in g_sent_packets_in_transit:
+        g_sent_packets_in_transit.remove(ack_num)
+        return 1
+    # if it isn't, it means we need to send an ACK to the server
+    else:
+        return -1
+
+'''
+    This function is inspired from the following stackoverflow exchange:
+    https://stackoverflow.com/a/28950776
+
+    Opens a socket to an unroutable address to find the default IP address.
+    A bit hacky, but is consistent.
+'''
+def get_local_ip_addr():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.connect((UNROUTABLE, 0))
+    ip_addr = sock.getsockname()[0] # first spot in tuple is IP address
+    sock.close()
+    return ip_addr
+
+# sends initial SYN packet, receives SYN/ACK, sends response ACK
+def handshake(send_sock, rec_sock, port, source_ip, dest_ip):
+    # start with our SYN
+    seq_num = generate_starting_seq_num()
+    packet = create_packet(source_ip, dest_ip, EMPTY, port, seq_num=seq_num)
+    print("starting connection")
+    queue_outgoing_packet(seq_num, packet, dest_ip, 0, pkt_type="syn")
+    send_packet_from_queue(send_sock)
+    res = wait_for_ack_packet(send_sock, rec_sock, dest_ip, port, seq_num, 0, packet, pkt_type="syn")
+    if res == ERR_TIME:
+        print("didn't get the ack we needed, exiting program...")
+        shutdown(send_sock, rec_sock)
+    rec_seq_num = TCPHeader.GetSeqNum(res[20:])
+    rec_ack_num = TCPHeader.GetAckNum(res[20:])
+    # set the global server sequence number so we can properly order packets
+    global SERVER_SEQ
+    SERVER_SEQ = rec_seq_num
+
+    new_seq_num = rec_ack_num
+    new_ack_num = rec_seq_num + 1
+
+    # generate return ACK packet
+    ack_packet = create_packet(source_ip, dest_ip, EMPTY, port, seq_num=new_seq_num, ack_num=new_ack_num, syn_flag=0, ack_flag=1)
+    queue_outgoing_packet(rec_seq_num+1, ack_packet, dest_ip, 0)
+    send_packet_from_queue(send_sock)
+    return (new_seq_num, new_ack_num)
+
+# helper function to generate the packet containing the HTTP GET request
+def create_get_packet(source_ip, dest_ip, msg, port, seq_num, ack_num):
+    get_packet = create_packet(source_ip, dest_ip, msg, port, seq_num=seq_num, ack_num=ack_num, syn_flag=0, ack_flag=1)
+    msg_len = len(msg)
+    return (get_packet, msg_len)
+
+# function to create an ACK packet to send to the server with no attached data
+def create_ack_packet(source_ip, dest_ip, port, seq_num, ack_num):
+    ack_packet = create_packet(source_ip, dest_ip, EMPTY, port, seq_num=seq_num, ack_num=ack_num, syn_flag=0, ack_flag=1)
+    return ack_packet
+
+# creates an ACK packet and puts it into the queue of packets to be sent
+def create_and_queue_ack_packet(source_ip, dest_ip, port, seq_num, ack_num):
+    ack_packet = create_ack_packet(source_ip, dest_ip, port, seq_num, ack_num)
+    queue_outgoing_packet(seq_num, ack_packet, dest_ip, 0, pkt_type="ack")
+    return
+
+# receives a single packet or waits until the specified timeout
+def receive_packet(rec_sock, dest_ip, port, wait_time):
+    timeout = time.time() + wait_time
+    packet = b''
+    while time.time() < timeout:
+        packet = rec_sock.recvfrom(65565)[0]
+        packet_elements = parse_packet_elements(packet)
+        # filter if its not from the destination IP address, wrong port, or duplicate packet
+        if packet_elements[0] != dest_ip or packet_elements[3] != port:
+            continue
+        if len(packet) > 0:
+            # if we receive a packet with an invalid checksum, we ignore it
+            packet_msg, rec_msg_len = get_message_from_packet(packet, packet_elements[6])
+            if not verify_checksum(packet_elements, packet, packet_msg):
+                continue
+            else:
+                return packet
+    return ERR_TIME
+
+# special function specifically for our syn, fin, and get packets
+# in these instance, we wait 1 min to receive the required ACK from the server
+def wait_for_ack_packet(send_sock, rec_sock, dest_ip, port, seq_num, msg_len, packet, pkt_type):
+    res = b''
+    count = 1
+    # if count goes up to 3, we have either received 3 packets that weren't correct
+    # or we waited 3 mins and have reached our hard timeout (though we may have received unwanted packets during this time)
+    while count < 4:
+        res = receive_packet(rec_sock, dest_ip, port, ACK_TIME)
+        # if we get a timeout, we resend the packet
+        if res == ERR_TIME:
+            queue_outgoing_packet(seq_num, packet, dest_ip, 0, pkt_type)
+            send_packet_from_queue(send_sock)
+            count +=1
+        # if we get a packet, we check that it's the right packet
+        else:
+            rec_ack_num = TCPHeader.GetAckNum(res[20:])
+            if match_ack(rec_ack_num) > 0:
+                return res
+            # if it isn't the right packet, we resend our packet and wait again
+            else:
+                queue_outgoing_packet(seq_num, packet, dest_ip, 0, pkt_type)
+                send_packet_from_queue(send_sock)
+                count +=1
+
+    return ERR_TIME
+
+# formats our GET message appropriately, sends it, and waits for the ACK to come in
+def send_get_packet(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, ack_num):
+    get = "GET " + sys.argv[1] + " HTTP/1.1\r\nHost: webcrawler-site.ccs.neu.edu\r\n\r\n"
+    get_packet, msg_len = create_get_packet(source_ip, dest_ip, get, port, seq_num, ack_num)
+    queue_outgoing_packet(seq_num, get_packet, dest_ip, msg_len, pkt_type="get")
+    send_packet_from_queue(send_sock)
+    res = wait_for_ack_packet(send_sock, rec_sock, dest_ip, port, seq_num, msg_len, get_packet, pkt_type="get")
+    if res == ERR_TIME:
+        print("ERROR: didn't get the packet we needed to continue")
+        exit()
+
+    return seq_num+msg_len
+
+# helper function to extract the data from the packet
+def get_message_from_packet(packet, offset):
+    iph_len = 20
+    tcph_len = offset * 4
+    msg = packet[iph_len+tcph_len:]
+    return (msg, len(msg))
+
+# unpacks all the items in the received packet and stores in a list
+def parse_packet_elements(packet):
+    packet_elements = []
+    # ip_elements = source IP addr and dest IP addr
+    ip_elements = IPHeader.UnpackIPHeader(packet)
+    packet_elements.extend(ip_elements)
+    # tcp elements = source port, dest port, seq num, ack num, offset + reserved, flags, window, checksum, urg ptr, optional data
+    tcp_elements = TCPHeader.UnpackTCPHeader(packet[20:]) # IP header is 20 bytes
+    packet_elements.extend(tcp_elements)
+
+    # update values in list for offset and flags
+    new_doff = packet_elements[6] >> 4
+    packet_elements[6] = new_doff
+    new_flags = TCPHeader.ParseFlags(packet_elements[7])
+    packet_elements[7] = new_flags
+
+    return packet_elements
+
+# this checks a message (in bytes) for HTTP header information
+# if none is found, packet has no HTTP info
+# if HTTP is found, make sure it is the correct repsonse code
+def check_code(msg):
+    try:
+        # make sure HTTP 1.1 is found
+        version = msg.decode().split("\n")[0].split(" ")[0]
+        # find response code
+        code = msg.decode().split("\n")[0].split(" ")[1]
+        if version == HTTP_VERSION:
+            # we only accept 200
+            if code == '200':
+                return True
+            # if it's another number, exit
+            else:
+                return ERR_HTTP
+        # if HTTP header has info, but no version found, we can ignore header entirely
+        else:
+            return False
+    # exception means no HTTP items found
+    except:
+        return False
+
+# finds the full data amount we expect to receive and the start location of the data relative to the HTTP header
+def parse_http(raw_data):
+    end = b'\r\n\r\n'   # this marks end of HTTP header
+    end_index = raw_data.find(end) + 4
+    full_hdr = raw_data[0:end_index]
+    string_hdr = full_hdr.decode()
+
+    content = 'Content-Length: ' # this field tells us how much data
+    start = string_hdr.find(content) # start of the field
+    end = string_hdr[start:].find('\r') # end of field
+    content_len = int(string_hdr[(start+len(content)):(start+end)]) # actual length between start & end
+    return (content_len, end_index)
+
+# parses the HTTP header and extracts data if available
+def parse_data(data, bytes_received, total_bytes, packet_msg, client_fin):
+    http_header = packet_msg[:HTTP_HEADER_MIN]
+    status = check_code(http_header) # check if HTTP header code was found
+    if status:
+        # if HTTP code present, check that the code returned was 200
+        if status == ERR_HTTP:
+            print("HTTP Response Code 200 not found, terminating...")
+            client_fin = True
+            return (ERR_HTTP, ERR_HTTP, ERR_HTTP, client_fin)
+        packet_data = packet_msg[HTTP_HEADER_MIN:]
+        content_len, data_index = parse_http(packet_data) # response tells us how many bytes
+        if total_bytes == 0:
+            total_bytes = content_len
+        bytes_received += len(packet_data[data_index:])
+        data += packet_data[data_index:]
+    else: # otherwise, packet was just data
+        data += packet_msg
+        bytes_received += len(packet_msg)
+        if bytes_received == total_bytes:
+            client_fin = True
+
+    return (data, bytes_received, total_bytes, client_fin)
+
+# attempts to open a file and write the sequenced bytes into it
+def process_data(data, fname):
+    try:
+        html_file = open(fname, 'wb')
+        html_file.write(data)
+        return 1
+    except:
+        print("something went wrong opening and writing to file")
+        return -1
+
+# if the server sends us a FIN/ACK, this function is called
+def server_terminate(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, ack_num):
+    print("beginning server termination")
+    # generate response fin/ack packet
+    fin_packet = create_packet(source_ip, dest_ip, EMPTY, port, seq_num=seq_num, ack_num=ack_num+1, fin_flag=1, syn_flag=0, ack_flag=1)
+    queue_outgoing_packet(seq_num, fin_packet, dest_ip, 0, pkt_type="fin")
+    send_packet_from_queue(send_sock)
+
+    res = wait_for_ack_packet(send_sock, rec_sock, dest_ip, port, seq_num, 0, fin_packet, pkt_type="fin")
+    if res == ERR_TIME:
+        print("shutdown")
+        shutdown(send_sock, rec_sock)
+
+# if we receive all the data we expect to receive, we start the connection close sequence
+def client_terminate(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, ack_num):
+    print("Transfer complete...closing connection")
+    # generate FIN/ACK packet
+    fin_packet = create_packet(source_ip, dest_ip, EMPTY, port, seq_num=seq_num, ack_num=ack_num, fin_flag=1, syn_flag=0, ack_flag=1)
+    queue_outgoing_packet(seq_num, fin_packet, dest_ip, 0, pkt_type="fin")
+    send_packet_from_queue(send_sock)
+
+    # get either fin or ack back
+    res = wait_for_ack_packet(send_sock, rec_sock, dest_ip, port, seq_num, 0, fin_packet, pkt_type="fin")
+    if res == ERR_TIME:
+        print("shutdown")
+        shutdown(send_sock, rec_sock)
+
+    # if we received an ACK msg, but not FIN msg, we want to receive again
+    received_packet_flags = parse_packet_elements(res)[7]
+
+    if TCPHeader.IsAck(received_packet_flags) == True and TCPHeader.IsFin(received_packet_flags) == False:
+        res = receive_packet(rec_sock, dest_ip, port, MAX_TIME)
+        if res == ERR_TIME:
+            exit()
+        second_set_flags = parse_packet_elements(res)[7]
+
+    # generate final ACK to send
+    create_and_queue_ack_packet(source_ip, dest_ip, port, seq_num + 1, ack_num + 1)
+    send_packet_from_queue(send_sock)
+
+# if we time out of otherwise receive a bad error, we kill the connection
+def shutdown(send_sock, rec_sock):
+    send_sock.close()
+    rec_sock.close()
+    exit()
+
+# loops through our list of packet numbers and places seq in the right, ordered location
+def reorder_pkt(pkt_lst, seq):
+    seq = relative_seq_num(seq) # we track relative sequence number
+    if pkt_lst:
+        for i in range(len(pkt_lst)):
+            if seq < pkt_lst[i]:
+                pkt_lst.insert(i, seq)
+                return
+    pkt_lst.append(seq)
+
+# tries to bind to local port if available
+def find_open_port(source_ip, port):
+    while True:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind((source_ip, port))
+            s.close()
+            break
+        except OSError as error:
+            print(error)
+            port = 50000 + random.randint(0, 15535)
+            print("trying again with port %i" % (port))
+    return port
+
+# loops through the packets the server is sending, organizes the packets,
+# and builds out the data
+# it returns flags used for error checking in main, the sequence number that we ended on,
+# and the total number of data bytes we read
+def tcp_loop(send_sock, rec_sock, source_ip, dest_ip, port, current_seq_num, current_byte_pos):
+    data = b''
+    cwnd = 1
+    total_bytes = 0
+    bytes_received = 0
+    # flags we set if we encounter an error or FIN
+    client_fin = False  # flag if we need to initiate connection close
+    server_fin = False # flag if server initiates connection close
+    cancel_write = False    # flag if we encounter error and data is useless
+    # this is for checking if we received the same duplicate packet multiple times
+    last_dup = (None, 0)
+    # this is used to track packets received out of order
+    pkt_order = []
+    # outer loop controls ack packet sending
+    while True:
+        if total_bytes:
+            print("Processing...", (bytes_received*100)//total_bytes, "%", end="\r")
+        # inner loop controls packet retrieval and parsing
+        while True:
+            packet = receive_packet(rec_sock, dest_ip, port, MAX_TIME)
+            if packet == ERR_TIME:
+                print("TIMEOUT ERROR: terminate connection")
+                client_fin = True
+                cancel_write = True
+                break
+            # packet elements: source_ip (0), dest_ip(1), source_port(2), dest_port(3), seq_num(4), ack_num(5), tcp_offset_data(6)
+            # tcp_flags(7), window_size(8), tcp_checksum(9), urgent_ptr(10)
+            packet_elements = parse_packet_elements(packet)
+            packet_msg, rec_msg_len = get_message_from_packet(packet, packet_elements[6])
+
+            # check for duplicate packets
+            if is_dup(packet_elements[4], packet_elements[5], rec_msg_len):
+                # if this was the last sequence we got, increase the count by one
+                if last_dup[0] == packet_elements[4]:
+                    last_dup = (packet_elements[4], last_dup[1]+1)
+                # otherwise, this is the first duplicate of this packet we've received
+                else:
+                    last_dup = (packet_elements[4], 1)
+                # if we've received too many duplicates, reset our window
+                if last_dup[1] >= MAX_DUPS:
+                    cwnd = 1
+                    last_dup = (None, 0)
+                break
+
+            received_packet_seq = packet_elements[4]
+            # if the packet is the one we are expecting
+            if received_packet_seq == current_byte_pos:
+                # this loop must run at least once to handle this packet
+                # runs more if we've received out of order packets
+                while True:
+                    #update our byte position value with the msg_len
+                    current_byte_pos += rec_msg_len
+                    # add sequence number as received
+                    order_seq_lst(received_packet_seq, packet_elements[5], rec_msg_len)
+
+                    # if there is data attached to the packet, extract and add to byte string
+                    if rec_msg_len > 0:
+                        data, bytes_received, total_bytes, client_fin = parse_data(data, bytes_received, total_bytes, packet_msg, client_fin)
+                        # break out if non-200 HTTP code found
+                        if data == ERR_HTTP:
+                            cancel_write = True
+                            break
+                    received_packet_flags = packet_elements[7]
+                    # if the packet is an ACK packet, previous packet received and no need to retransmit
+                    if TCPHeader.IsAck(received_packet_flags) == True:
+                        match_ack(packet_elements[5])
+                        # if we received an ACK message, we want to increase the cwnd
+                        if cwnd < MAX_CWND:
+                            cwnd += 1
+                        # if packet has ACK flag set, but also contains data, we want to send a response ACK
+                        if rec_msg_len > 0:
+                            create_and_queue_ack_packet(source_ip, dest_ip, port, current_seq_num, current_byte_pos)
+
+                    # check to see if we received a fin packet
+                    if TCPHeader.IsFin(received_packet_flags) == True:
+                        server_fin = True
+
+                    # if we have no out of order packets to handle, we can exit our packet dissection loop
+                    if not pkt_order:
+                        break
+                    else: # otherwise, fix up our variables with next packet in order
+                        global g_received_packets
+                        num = pkt_order.pop(0)
+                        packet = g_received_packets[num][1] # use the relative sequence number to get our packet
+                        del g_received_packets[num]
+                        packet_elements = parse_packet_elements(packet)
+                        packet_msg, rec_msg_len = get_message_from_packet(packet, packet_elements[6])
+                        received_packet_seq = packet_elements[4]
+                        # if this is another unexpected packet, break out to try and receive the expected one
+                        if received_packet_seq != current_byte_pos:
+                            break
+
+                break
+            # if packet is not the expected next packet
+            else:
+                # keep accepting packets since they may just be out of order
+                if len(g_received_packets) < MAX_BUFFER_LEN:
+                    # store it for acking
+                    store_out_of_order_packet(received_packet_seq, rec_msg_len, packet)
+                    # place it in the right spot in our local out of order packet list
+                    reorder_pkt(pkt_order, received_packet_seq)
+                    continue
+
+                else: # if we collected the max number of mis-ordered packets we're willing to tolerate
+                    for i in range(len(g_received_packets)):
+                        cwnd = 1
+                        create_and_queue_ack_packet(source_ip, dest_ip, port, current_seq_num, current_byte_pos)
+
+        # send packets from queue while within cwnd level
+        packets_in_transit = len(g_sent_packets_in_transit)
+        while packets_in_transit < cwnd:
+            if len(g_outgoing_packets) > 0:
+                packet_sent = send_packet_from_queue(send_sock)
+                packets_in_transit = len(g_sent_packets_in_transit)
+            else: break
+
+        # before going back to receiving packets, check to see if we need to close the connection
+        if server_fin or client_fin:
+            break
+
+    return server_fin, client_fin, cancel_write, current_seq_num, current_byte_pos, data
+
+# driver for most of the code: handles command line arg checking, socket setup,
+# then calls the data retrieval loop and exits appropriately
+def main():
+    if len(sys.argv) != 2:
+        print("URL required")
+        return
+    info = urlparse(sys.argv[1])
+    filename = DEF_NAME
+    if info.path and info.path[-1] != '/':
+        filename = info.path.split('/')[-1]
+
+    send_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+    send_sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+    rec_sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+    rec_sock.settimeout(MAX_TIME) # socket time out set to 3 minutes
+    source_ip = get_local_ip_addr()
+    dest_ip = socket.gethostbyname(info.hostname)
+    port = find_open_port(source_ip, (50000 + random.randint(0, 15535)))
+    rec_sock.bind((source_ip, port))
+
+    # 3 way handshake
+    seq_num, ack_num = handshake(send_sock, rec_sock, port, source_ip, dest_ip)
+
+    # current_byte_pos = handshake: last sent packet ack value
+    byte_pos = ack_num
+
+    # send GET message - seq_num and ack_num will be the same since the last message (ack in handshake) had no data
+    seq_num = send_get_packet(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, ack_num)
+
+    # enter our data retrieval loop
+    server_fin, client_fin, cancel_write, seq_num, byte_pos, data = tcp_loop(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, byte_pos)
+
+    # if the server sent us a FIN packet, we call server_terminate
+    if server_fin:
+        server_terminate(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, byte_pos)
+    # if we received all the data we need, we call client_terminate
+    elif client_fin:
+        client_terminate(send_sock, rec_sock, source_ip, dest_ip, port, seq_num, byte_pos)
+
+    send_sock.close()
+    rec_sock.close()
+
+    # if we retrieved data successfully, write out to file
+    if not cancel_write:
+        process_data(data, filename)
+
+main()
